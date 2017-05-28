@@ -1,0 +1,88 @@
+<html><head>
+<title>TETRISCH</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<link rel="apple-touch-icon-precomposed" href="http://cdn1.iconfinder.com/data/icons/CrystalClear/128x128/apps/ksirtet.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="viewport" content="target-densitydpi=device-dpi; width=device-width; initial-scale=1.0; maximum-scale=1.0; user-scalable=1;" />
+<script>
+var connection = new WebSocket('ws://'+location.hostname+':81/', ['arduino']);
+connection.onopen = function () {
+connection.send('Connect ' + new Date());
+};
+connection.onerror = function (error) {
+console.log('WebSocket Error ', error);
+};
+connection.onmessage = function (e) {
+console.log('Server: ', e.data);
+document.getElementById("info").innerHTML = e.data;
+};
+
+</script>
+<style>
+body {
+	background-color: #000;
+	color: #aaa;
+	font-family: arial;
+}
+
+table, tr, td {
+	padding: 5px;
+	text-align: center;
+	margin-left:auto;
+    margin-right:auto;
+}
+
+p {
+	font-size: 100%;
+}
+
+h1 {
+	text-align: center;
+}
+
+button {
+	font-size: 200%;
+	width: 100px;
+	height: 65px;
+}
+</style>
+</head>
+<body>
+	<h1>😃😃 TETRISCH 😃😃</h1>
+	<table>
+	<tr></tr>
+	<tr></tr>
+	<tr></tr>
+	<tr></tr>
+	<tr></tr>
+	<tr>
+		<td><button id="x" type="button" onclick="connection.send('x');">&#x21BB;</button></td>
+		<td><p id="info">Lines: -<br />Level: -</p></td>
+		<td><button id="y" type="button" onclick="connection.send('y');">&#x21BA;</button></td>
+	</tr>
+	<tr>
+		<td><button id="l" type="button" onclick="connection.send('l');">&#x2190;</button></td>
+		<td><button id="d" type="button" onclick="connection.send('d');">&#x2193;</button></td>
+		<td><button id="r" type="button" onclick="connection.send('r');">&#x2192;</button></td>
+	</tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr><td>&nbsp;</td></tr>
+	<tr>
+		<td><button id="n" type="button" onclick="connection.send('n');">new</button></td>
+		<td><button id="n" type="button" onclick="connection.send('w');">reset</button></td>
+	</tr>
+	</table>
+</body>
+</html>

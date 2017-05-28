@@ -1,177 +1,160 @@
+#include <ESP8266WiFi.h>
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <WiFiManager.h>
 #include <NeoPixelBus.h>
 #include "SimpleTimer.h"
-#include "fonts/6x8_vertikal_MSB_1.h"
+#include "RenderFont.h"
+#include <WebSocketsServer.h>
+#include "index_html.h"
 
-#define SerialDebug(text) Serial.print(text);
+bool debug = true;
+#define SerialDebug(text)   Serial.print(text);
 #define SerialDebugln(text) Serial.println(text);
 
-#define redButtonPin 12
-#define blueButtonPin 14
-#define downButtonPin 13
+#define BAUD 9600
+#define SERIAL_TIMEOUT 200
+#define CONFIG_PORTAL_TIMEOUT 2 * 60
+#define CONNECTION_TIMOUT 3000
+#define REBOOT_TIMEOUT 5000
 
-int redButtonState = 1;
-int blueButtonState = 1;
-int downButtonState = 0;
+// GAME CONSTANTS
+#define TEXT_INTERVAL 150
+#define INITIAL_INTERVAL 1000
+#define INTERVAL_DELTA 100
+#define NUM_LINES_PER_LEVEL 10
+#define MAX_STONES 7 // stone patterns: l     L     T     L^t   z     o     s
+const uint8_t Stones[MAX_STONES] =     {0x0F, 0x2E, 0x4E, 0x8E, 0x6C, 0xCC, 0xC6};
 
-int redButtonPrevState = 1;
-int blueButtonPrevState = 1;
-int downButtonPrevState = 0;
+// STATE
+byte Mode = 1; // 1: Intro ticker, 2: tetris, 3: stats after game over
+char MyIp[16];
+char MyHostname[16];
+int Lines = 0;
+int Level = 1;
 
-int xAxisValue = 550; // neutral position
-int xAxisState = 0;
-int xAxisPrevState = 0;
+ESP8266WebServer server = ESP8266WebServer(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
 
-#define Width       10
-#define Height       17
+// DISPLAY
+#define Width       13
+#define Height      23
 #define pixelCount (Width*Height)
-#define pixelPin    3 // should be ignored because of NeoEsp8266Dma800KbpsMethod
+#define pixelPin    3          // should be ignored because of NeoEsp8266Dma800KbpsMethod
 NeoPixelBus<NeoGrbFeature, NeoEsp8266Dma800KbpsMethod> strip(pixelCount, pixelPin); // this is on GPIO3 (RXD) due hardware limitations
-NeoTopology <RowMajorAlternatingLayout> topo(Width, Height);
+NeoTopology <ColumnMajorAlternatingLayout> topo(Width, Height);
 RgbColor black = RgbColor(0);
 
-#define FontWidth 6
-#define MaxTextLen  255
-byte Text[MaxTextLen];
-int TextPos = 0;
-int TextLen = 0;
-SimpleTimer TextTimer;
-int TextTimerId;
-RgbColor TextCol = RgbColor(128, 128, 128);
-int TextOffsetY = 4; // pixel distance from bottom
+// data structure for current and next stone
+struct sStone {
+  int8_t   x, y;
+  uint8_t  id;
+  int8_t   dir;
+  RgbColor col;
+} Stone, NewStone;
 
-SimpleTimer RunningLightTimer;
-int RunningLightTimerId;
-int RunningLightPos = 0;
-RgbColor RunningLightCol = RgbColor(128, 128, 128);
+// game timer
+SimpleTimer TetrisTimer;
+int TetrisTimerId;
 
-byte Mode = 1; // 1: Intro ticker, 2: tetris, 3: stats after game over
-
-// sets the bits in the text buffer accordinng to the character x
-byte RenderLetter(byte * pos, const char x) {
-  byte l = 0;
-  for (int i = 0 ; i < FontWidth ; i++) {
-    if (font[x][i] != 0) {
-      pos[l] = font[x][i];
-      l++;
-    }
-  }
-  return l;
-}
-
-// prepares text buffer and other variables for rendering
-void RenderText(const uint8_t * text, size_t len) {
-  const uint8_t * p = text;
-  TextPos = TextLen = 0;
-
-  for (size_t i = 0 ; i < len && i < MaxTextLen - 8 ; i++) {
-    TextLen += RenderLetter(&Text[TextLen], *p);
-    // one row free space
-    Text[TextLen] = 0;
-    TextLen++;
-    p++;
-  }
-}
-void RenderText(const char * text) {
-  RenderText((const uint8_t *) text, strlen(text));
-}
-void RenderText(String s) {
-  RenderText((const uint8_t *)s.c_str(), s.length());
-}
-
-// displays the text
+// displays text
 void ShowText() {
   TextPos++;
   if (TextPos > TextLen) {
     TextPos = 0;
   }
   strip.ClearTo(black);
-  for (uint8_t x = 0 ; x < Width ; x++) {
+  for (uint8_t x = 0 ; x < Height ; x++) {
     if (TextPos + x >= TextLen) {
       break;
     }
     for (int y = 0 ; y < 8 ; y++) {
       if ((Text[TextPos + x] & (1 << y)) != 0) {
-        strip.SetPixelColor(topo.Map(Width - x - 1, y + TextOffsetY), TextCol);
+        // to make better use of the display size, the text is displayed transposed, i.e. x and y are swapped here
+        strip.SetPixelColor(topo.Map(y + TextOffsetY, x), TextCol);
       }
     }
   }
   strip.Show();
 }
 
-#define RatioFeeStone 10
-#define MaxStones   7
-const uint8_t Stones[MaxStones] = {0x0F, 0x2E, 0x4E, 0x8E, 0x6C, 0xCC, 0xC6}; // FEESTONE: , 0xAF};
-struct sStone {
-  int8_t    x, y;
-  uint8_t   id;
-  int8_t   dir;
-  RgbColor  col;
-} Stone, NewStone;
-
-SimpleTimer TetrisTimer;
-int TetrisTimerId;
-int Lines = 0;
-int Level = 1;
-
+// GAME logic starts here
 void MoveStoneDown();
+
+// increase speed
 void UpdateLevel() {
-  int interval = 1000 - (50 * Level);
+  int interval = INITIAL_INTERVAL - (INTERVAL_DELTA * Level);
   TetrisTimer.deleteTimer(TetrisTimerId);
   TetrisTimerId = TetrisTimer.setInterval(interval, MoveStoneDown);
 }
 
-void DrawStone(bool draw) {
-  for (int8_t y = 0 ; y < 4 ; y++) {
-    for (int8_t x = 0 ; x < 2 ; x++) {
-      if ((Stones[Stone.id] & (1 << (y + x * 4))) != 0) {
-        int8_t x1 = Stone.x, y1 = Stone.y;
-        switch (Stone.dir) {
-          case 0: x1 += x - 1; y1 += y - 2; break;
-          case 1: x1 += y - 2; y1 -= x - 1; break;
-          case 2: x1 -= x - 1; y1 -= y - 2; break;
-          case 3: x1 -= y - 2; y1 += x - 1; break;
-        }
-        if (y1 < Height) strip.SetPixelColor(topo.Map(x1, y1), draw ? Stone.col : black);
-      }
-    }
-  }
-  strip.Show();
-}
-
-void CalcNewStone(uint8_t dir) {
-  NewStone = Stone;
-  switch (dir) {
-    case 1: NewStone.y--; break;    // Down (SM: was x--)
-    case 2: NewStone.x++; break;    // Left (SM: was y++)
-    case 3: NewStone.x--; break;    // Right (SM: was y--)
-    case 4: NewStone.dir++;         // Rotate left
-      if (NewStone.dir > 3) NewStone.dir = 0; break;
-    case 5: NewStone.dir--;         // Rotate right
-      if (NewStone.dir < 0) NewStone.dir = 3; break;
-  }
-}
-
+// create new stone
 void NextStone() {
   Stone.x = Width / 2;
   Stone.y = Height;
-  Stone.id = random(0, MaxStones);
+  Stone.id = random(0, MAX_STONES);
   Stone.dir = 0;
   Stone.col = RgbColor(random(5, 255), random(5, 255), random(5, 255));
+}
+
+// update
+void CalcNewStone(uint8_t dir) {
+  NewStone = Stone;
+  switch (dir) {
+    case 1: // Down
+      NewStone.y--;
+      break;
+    case 2: // Right
+      NewStone.x++;
+      break;
+    case 3: // Left
+      NewStone.x--;
+      break;
+    case 4: // Rotate left
+      NewStone.dir--;
+      if (NewStone.dir < 0) {
+        NewStone.dir = 3;
+      }
+      break;
+    case 5: // Rotate right
+      NewStone.dir++;
+      if (NewStone.dir > 3) {
+        NewStone.dir = 0;
+      }
+      break;
+  }
 }
 
 uint8_t CheckSpace() {
   for (int8_t y = 0 ; y < 4 ; y++) {
     for (int8_t x = 0 ; x < 2 ; x++) {
-      if ((Stones[NewStone.id] & (1 << (y + x * 4))) != 0) {
+      if ((Stones[NewStone.id] & (1 << (y + x * 4))) != 0) { // bit set in stone pattern?
+        // compute all occupied x and y coordinates depending on stone's position and orientation
         int8_t x1 = NewStone.x, y1 = NewStone.y;
         switch (NewStone.dir) {
-          case 0: x1 += x - 1; y1 += y - 2; break;
-          case 1: x1 += y - 2; y1 -= x - 1; break;
-          case 2: x1 -= x - 1; y1 -= y - 2; break;
-          case 3: x1 -= y - 2; y1 += x - 1; break;
+          case 0:
+            x1 += x - 1;
+            y1 += y - 2;
+            break;
+          case 1:
+            x1 += y - 2;
+            y1 -= x - 1;
+            break;
+          case 2:
+            x1 -= x - 1;
+            y1 -= y - 2;
+            break;
+          case 3:
+            x1 -= y - 2;
+            y1 += x - 1;
+            break;
         }
-        if (x1 < 0 || x1 >= Width) return 1; // too far left / right
-        if (y1 < 0) return 2; // bottom reached
+        if (x1 < 0 || x1 >= Width) {
+          return 1; // too far left / right
+        }
+        if (y1 < 0) {
+          return 2; // bottom reached
+        }
         if (strip.GetPixelColor(topo.Map(x1, y1)).CalculateBrightness() != 0) {
           return 3; // stone blocked
         }
@@ -183,16 +166,17 @@ uint8_t CheckSpace() {
 
 // removes full rows and downshifts everything above
 void CheckRows() {
-  for (int y = 0 ; y < Height ; ) {
+  for (int y = 0 ; y < Height;) {
     uint8_t cnt = 0;
     for (int x = 0 ; x < Width ; x++) {
-      if (strip.GetPixelColor(topo.Map(x, y)).CalculateBrightness() != 0)
+      if (strip.GetPixelColor(topo.Map(x, y)).CalculateBrightness() != 0) {
         cnt++;
+      }
     }
     if (cnt == Width) { // current row is full
+      // shift everything down by one row
       for (int y1 = y ; y1 < Height - 1 ; y1++) {
-        for (int x = 0 ; x < Width ; x++) {
-          // shift everything down by one row
+        for (int x = 0 ; x < Width; x++) {
           strip.SetPixelColor(topo.Map(x, y1), strip.GetPixelColor(topo.Map(x, y1 + 1)));
         }
       }
@@ -202,10 +186,11 @@ void CheckRows() {
       }
       strip.Show();
       Lines++;
-      if ((Lines % 10) == 0) {
+      if ((Lines % NUM_LINES_PER_LEVEL) == 0) {
         Level++;
         UpdateLevel();
       }
+      UpdateClient();
       continue;
     }
     y++;
@@ -217,18 +202,55 @@ bool CheckGameOver() {
          strip.GetPixelColor(topo.Map(Width / 2 - 1, Height - 1)).CalculateBrightness() != 0;
 }
 
+// display stone (draw = true) or hide it
+void DrawStone(bool draw) {
+  // compute all occupied x and y coordinates depending on stone's position and orientation
+  for (int8_t y = 0 ; y < 4 ; y++) {
+    for (int8_t x = 0 ; x < 2 ; x++) {
+      if ((Stones[Stone.id] & (1 << (y + x * 4))) != 0) { // bit set in stone pattern?
+        int8_t x1 = Stone.x, y1 = Stone.y;
+        switch (Stone.dir) {
+          case 0:
+            x1 += x - 1;
+            y1 += y - 2;
+            break;
+          case 1:
+            x1 += y - 2;
+            y1 -= x - 1;
+            break;
+          case 2:
+            x1 -= x - 1;
+            y1 -= y - 2;
+            break;
+          case 3:
+            x1 -= y - 2;
+            y1 += x - 1;
+            break;
+        }
+        if (y1 < Height) {
+          strip.SetPixelColor(topo.Map(x1, y1), draw ? Stone.col : black);
+        }
+      }
+    }
+  }
+  strip.Show();
+}
+
+// next game step
 void MoveStoneDown() {
-  CalcNewStone(1);
-  DrawStone(false);
-  switch (CheckSpace()) {
-    case 0:     // OK!
-    case 1:     // Move too far left/right
-      Stone = NewStone;
-      break;
-    case 2:     // reached bottom
-    case 3:     // stone blocked
-      DrawStone(true);
-      CheckRows();
+  CalcNewStone(1); // try to shift current stone down, store it in NewStone
+  DrawStone(false); // hide stone Stone at its current position
+  switch (CheckSpace()) { // check if position of NewStone is valid
+    case 0: // OK! drops through to case 1!
+    case 1: // too far left/right
+      // this case is probably handled incorrectly.
+      // however, it doesn't have any effect as the stones only move down, and therefore it is never triggered.
+      Stone = NewStone; // this should go to case 0, followed by a break;
+      break; // this should go away, so that case 1 drops through to case 2 and 3.
+    case 2: // reached bottom. drops through to case 3!
+    case 3: // stone blocked
+      DrawStone(true); // display old stone again
+      CheckRows(); // full row?
       if (CheckGameOver()) {
         GameOver();
         return;
@@ -237,16 +259,95 @@ void MoveStoneDown() {
       }
       break;
   }
-  DrawStone(true);
+  DrawStone(true); // display new stone
 }
 
 void NewGame() {
+  TetrisTimer.deleteTimer(TetrisTimerId);
+  TetrisTimerId = TetrisTimer.setInterval(INITIAL_INTERVAL, MoveStoneDown);
   strip.ClearTo(black);
   strip.Show();
   NextStone();
+  NewStone = Stone;
   Lines = 0;
   Level = 1;
   UpdateLevel();
+  UpdateClient();
+}
+
+// send # of lines and levels to web clients
+void UpdateClient() {
+  String s;
+  s += "Lines: ";
+  s += Lines;
+  s += "<br />Level: ";
+  s += Level;
+  webSocket.broadcastTXT(s);
+}
+
+// forget WIFI (requires manual restart of the ESP)
+void ResetWifi() {
+  Mode = 1;
+  WiFiManager wifiManager;
+  wifiManager.resetSettings();
+
+  setup();
+}
+
+// react to input from the web clients
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      break;
+    case WStype_CONNECTED: {
+        IPAddress ip = webSocket.remoteIP(num);
+        webSocket.sendTXT(num, "Connected");
+        if (Mode != 2) {
+          Mode = 2;
+          NewGame();
+        }
+      }
+      break;
+    case WStype_TEXT: {
+        // RenderText(payload, len);
+        switch (*payload) {
+          case 'd': // down
+            CalcNewStone(1);
+            break;
+          case 'l': // left
+            CalcNewStone(2);
+            break;
+          case 'r': // right
+            CalcNewStone(3);
+            break;
+          case 'x': // rotate left
+            CalcNewStone(4);
+            break;
+          case 'y': // rotate right
+            CalcNewStone(5);
+            break;
+          case 'n': // new
+            NewGame();
+            break;
+          case 'w': // reset
+            ResetWifi();
+            break;
+        }
+        DrawStone(false); // hide old stone
+        switch (CheckSpace()) {
+          case 0: // OK!
+            // we can use the updated stone
+            Stone = NewStone;
+            break;
+          case 1: // too far left/right
+          case 2: // reached bottom
+          case 3: // stone blocked
+            break;
+        }
+        DrawStone(true); // draw updated stone
+      }
+      break;
+  }
 }
 
 void GameOver() {
@@ -255,207 +356,68 @@ void GameOver() {
   snprintf(GameStats, MaxTextLen, "    GAME OVER   Lines %d   Level %d", Lines, Level);
   RenderText(GameStats);
   TextTimer.deleteTimer(TextTimerId);
-  TextTimerId = TextTimer.setInterval(150, ShowText);
-  Mode = 3;
+  TextTimerId = TextTimer.setInterval(TEXT_INTERVAL, ShowText);
+  Mode = 3; // 1?
 }
 
 String GetCredits() {
-  return String("TEAM TETRIS  Basti, David, Dessi, Lisa, Michael A, Michael T, Ralf, Sarah, Seppl, Thilo, Verena K, Verena T");
-}
-
-void MoveRunningLight() {
-  strip.SetPixelColor(RunningLightPos, black);
-  RunningLightPos++;
-  RunningLightPos = RunningLightPos % pixelCount;
-  strip.SetPixelColor(RunningLightPos, RunningLightCol);
-  strip.Show();
-}
-
-void StartRunningLight() {
-  strip.ClearTo(black);
-  RunningLightPos = 0;
-  RunningLightCol = RgbColor(1, random(1, 255), 1);
-  RunningLightTimer.setInterval(60, MoveRunningLight);
-  RunningLightTimer.run();
+  return String("TEAM TETRIS  Basti, Fadime, Seppl");
 }
 
 void setup() {
-  Serial.begin(9600);
-  Serial.setTimeout(200);
+  Serial.begin(BAUD);
+  Serial.setTimeout(SERIAL_TIMEOUT);
   delay(100);
 
+  // start wifi manager (make ESP an access point first to allow connecting to an existing wifi, or reconnect to a configured wifi)
+  WiFiManager wifiManager;
+  wifiManager.setDebugOutput(debug);
+  wifiManager.setTimeout(CONFIG_PORTAL_TIMEOUT); // two minute timeout for the config portal
+  if (!wifiManager.autoConnect()) { // attempt to connect to a wifi, reboot on failure
+    delay(CONNECTION_TIMOUT);
+    ESP.reset();
+    delay(REBOOT_TIMEOUT);
+  }
+  // on connection success, display the ESP's IP address
+  IPAddress MyIP = WiFi.localIP();
+  snprintf(MyIp, 16, "%d.%d.%d.%d", MyIP[0], MyIP[1], MyIP[2], MyIP[3]);
+  snprintf(MyHostname, 15, "ESP-%08x", ESP.getChipId());
+  RenderText(WiFi.localIP().toString().c_str());
+
+  // also send hostname over serial bus
+  SerialDebug("ESP-Hostname: ");
+  SerialDebugln(MyHostname);
+
+  // set up text and game timers
+  TextTimer.setInterval(TEXT_INTERVAL, ShowText);
+  TetrisTimerId = TetrisTimer.setInterval(INITIAL_INTERVAL, MoveStoneDown);
+
+  // start webserver & open websocket for communication
+  server.on("/", []() {
+    server.send(200, "text/html", index_html);
+  });
+  server.begin();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+
   strip.Begin();
-  strip.ClearTo(RgbColor(255));;
-  strip.Show();
-
-  pinMode(blueButtonPin, INPUT);
-  pinMode(redButtonPin, INPUT);
-  pinMode(downButtonPin, INPUT);
-
-  RenderText((String("    FEETISCH       ")).c_str());
-  TextTimerId = TextTimer.setInterval(150, ShowText);
-  TetrisTimerId = TetrisTimer.setInterval(1000, MoveStoneDown);
-
   strip.ClearTo(black);
   strip.Show();
 }
 
 void loop() {
-  redButtonState = digitalRead(redButtonPin);
-  blueButtonState = digitalRead(blueButtonPin);
-  downButtonState = digitalRead(downButtonPin);
-  xAxisValue = analogRead(A0);
-
-  if (xAxisValue < 640) {
-    xAxisState = -1;
-  } else if (xAxisValue > 880) {
-    xAxisState = 1;
-  } else {
-    xAxisState = 0;
-  }
+  server.handleClient();
+  webSocket.loop();
 
   switch (Mode) {
-    case 1: // intro
-      if (blueButtonState != blueButtonPrevState) {
-        if (blueButtonState == 0) {
-          Mode = 2;
-          NewGame();
-        }
-        blueButtonPrevState = blueButtonState;
-      } else if (redButtonState != redButtonPrevState) {
-        if (redButtonState == 0) {
-          // TextPos = 0;
-          // RenderText(GetCredits());
-          // TextTimer.deleteTimer(TextTimerId);
-          // TextTimerId = TextTimer.setInterval(150, ShowText);
-          // Mode = 3;
-        }
-        redButtonPrevState = redButtonState;
-      } else if (xAxisState != xAxisPrevState) {
-        Mode = 4;
-        xAxisPrevState = xAxisState;
-        StartRunningLight();
-        break;
-      }
+    case 1:
       TextTimer.run();
       TextCol = RgbColor(random(1, 255), random(1, 255), random(1, 255));
       break;
-    case 2: // tetris game
-      if (redButtonState != redButtonPrevState) {
-        if (redButtonState == 0) {
-          CalcNewStone(4);
-          DrawStone(false);
-          switch (CheckSpace()) {
-            case 0:     // OK!
-              Stone = NewStone;
-              break;
-            case 1:     // Move too far left/right
-            case 2:     // reached bottom
-            case 3:     // stone blocked
-              break;
-          }
-          DrawStone(true);
-        }
-        redButtonPrevState = redButtonState;
-      }
-
-      if (blueButtonState != blueButtonPrevState) {
-        if (blueButtonState == 0) {
-          NewGame();
-          DrawStone(false);
-          switch (CheckSpace()) {
-            case 0:     // OK!
-              Stone = NewStone;
-              break;
-            case 1:     // Move too far left/right
-            case 2:     // reached bottom
-            case 3:     // stone blocked
-              break;
-          }
-          DrawStone(true);
-        }
-        blueButtonPrevState = blueButtonState;
-      }
-
-      if (downButtonState != downButtonPrevState) {
-        if (downButtonState == 1) {
-          CalcNewStone(1);
-          DrawStone(false);
-          switch (CheckSpace()) {
-            case 0:     // OK!
-              Stone = NewStone;
-              break;
-            case 1:     // Move too far left/right
-            case 2:     // reached bottom
-            case 3:     // stone blocked
-              break;
-          }
-          DrawStone(true);
-
-        }
-        downButtonPrevState = downButtonState;
-      }
-
-      if (xAxisState != xAxisPrevState) {
-        // left
-        if (xAxisState == -1) {
-          CalcNewStone(2);
-          DrawStone(false);
-          switch (CheckSpace()) {
-            case 0:     // OK!
-              Stone = NewStone;
-              break;
-            case 1:     // Move too far left/right
-            case 2:     // reached bottom
-            case 3:     // stone blocked
-              break;
-          }
-          DrawStone(true);
-        }
-
-        // right
-        if (xAxisState == 1) {
-          CalcNewStone(3);
-          DrawStone(false);
-          switch (CheckSpace()) {
-            case 0:     // OK!
-              Stone = NewStone;
-              break;
-            case 1:     // Move too far left/right
-            case 2:     // reached bottom
-            case 3:     // stone blocked
-              break;
-          }
-          DrawStone(true);
-        }
-
-        xAxisPrevState = xAxisState;
-      }
-
+    case 2:
       TetrisTimer.run();
       break;
-    case 3: // game stats
-      if (blueButtonState != blueButtonPrevState) {
-        if (blueButtonState == 0) {
-          Mode = 2;
-          NewGame();
-        }
-        blueButtonPrevState = blueButtonState;
-      }
-      TextTimer.run();
-      TextCol = RgbColor(random(1, 255), random(1, 255), random(1, 255));
-      break;
-    case 4: // running light
-      if (blueButtonState != blueButtonPrevState) {
-        if (blueButtonState == 0) {
-          Mode = 2;
-          NewGame();
-        }
-        blueButtonPrevState = blueButtonState;
-      }
-      RunningLightTimer.run();
-      break;
-    default: Mode = 1;
+    default:
+      Mode = 1;
   }
 }
-
